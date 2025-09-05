@@ -1,0 +1,151 @@
+diff --git a/web/index.html b/web/index.html
+index abcdef0..1234567 100644
+--- a/web/index.html
++++ b/web/index.html
+@@
++<script type="module">
++  window.eaglercraftXOpts = window.eaglercraftXOpts || {};
++  // Apply low-overhead defaults for all devices
++  (function(opts){
++    opts.chromebookMode = true;
++    opts.defaultGraphics = opts.defaultGraphics || {};
++    Object.assign(opts.defaultGraphics, {
++      renderDistance: 6,
++      enableShadows: false,
++      enablePBR: false,
++      enableReflections: false,
++      particles: 'minimal',
++      textureAtlasSize: 2048,
++      maxChunkMeshingWorkers: Math.max(1, Math.floor((navigator.hardwareConcurrency||2)/2)),
++      vsync: true,
++      maxFPS: 60
++    });
++    console.log('EaglercraftX: Worker-based meshing + low-overhead defaults applied', opts.defaultGraphics);
++  })(window.eaglercraftXOpts);
++</script>
+diff --git a/web/js/utils/arrayPool.js b/web/js/utils/arrayPool.js
+new file mode 100644
+index 0000000..abcdef0
++++ b/web/js/utils/arrayPool.js
+@@
++export class ArrayPool {
++  constructor(TypedCtor, cap = 128) {
++    this.TypedCtor = TypedCtor;
++    this.cap = cap;
++    this.free = [];
++  }
++
++  get(length) {
++    for(let i=0;i<this.free.length;i++){
++      const a = this.free[i];
++      if(a.length >= length){
++        this.free.splice(i,1);
++        return a.subarray(0,length);
++      }
++    }
++    return new this.TypedCtor(length);
++  }
++
++  put(buf){
++    if(!(buf && buf.buffer)) return;
++    if(this.free.length < this.cap) this.free.push(buf.constructor===this.TypedCtor?buf:new this.TypedCtor(buf.length));
++  }
++}
++
++export const F32Pool = new ArrayPool(Float32Array,256);
++export const U16Pool = new ArrayPool(Uint16Array,256);
++export const U8Pool = new ArrayPool(Uint8Array,512);
+diff --git a/web/js/meshing/mesher.worker.js b/web/js/meshing/mesher.worker.js
+new file mode 100644
+index 0000000..abcdef0
++++ b/web/js/meshing/mesher.worker.js
+@@
++self.onmessage=function(e){
++  const msg=e.data;
++  if(!msg||!msg.blocks){ postMessage({error:'No blocks in message'}); return;}
++  const blocks=msg.blocks;
++  const dims=msg.dims||{x:16,y:256,z:16};
++  const options=msg.options||{};
++  try{
++    const w=dims.x,h=dims.y,d=dims.z;
++    const maxBlocks=blocks.length;
++    const maxVertices=maxBlocks*24;
++    const maxIndices=maxBlocks*36;
++    const vertices=new Float32Array(maxVertices);
++    const indices=new Uint16Array(maxIndices);
++    let vPos=0,iPos=0,vertexCount=0;
++    const IDX=(x,y,z)=>x+y*w+z*w*h;
++    for(let z=0;z<d;++z){for(let y=0;y<h;++y){for(let x=0;x<w;++x){
++      const b=blocks[IDX(x,y,z)]; if(!b) continue;
++      const px=x,py=y,pz=z;
++      const corners=[[px,py,pz],[px+1,py,pz],[px+1,py+1,pz],[px,py+1,pz],[px,py,pz+1],[px+1,py,pz+1],[px+1,py+1,pz+1],[px,py+1,pz+1]];
++      const faceIdx=[0,1,2,0,2,3,4,5,6,4,6,7,0,1,5,0,5,4,2,3,7,2,7,6,1,2,6,1,6,5,0,3,7,0,7,4];
++      const base=vertexCount;
++      for(let ci=0;ci<8;ci++){const vv=corners[ci]; vertices[vPos++]=vv[0]; vertices[vPos++]=vv[1]; vertices[vPos++]=vv[2]; vertexCount++;}
++      for(let fi=0;fi<faceIdx.length;fi++){indices[iPos++]=base+faceIdx[fi];}
++    }}}
++    const usedV=vertices.subarray(0,vPos);
++    const usedI=indices.subarray(0,iPos);
++    postMessage({vertices:usedV,indices:usedI},[usedV.buffer,usedI.buffer]);
++  }catch(err){postMessage({error:err&&err.message?err.message:String(err)});}
++};
+diff --git a/web/js/meshing/mesherPool.js b/web/js/meshing/mesherPool.js
+new file mode 100644
+index 0000000..abcdef0
++++ b/web/js/meshing/mesherPool.js
+@@
++import { U8Pool } from '../utils/arrayPool.js';
++
++const DEFAULT_WORKER_MODULE='/js/meshing/mesher.worker.js';
++
++export class MesherPool{
++  constructor(workerScript=DEFAULT_WORKER_MODULE,poolSize=Math.max(1,Math.floor((navigator.hardwareConcurrency||2)/2))){
++    this.poolSize=poolSize; this.workerScript=workerScript;
++    this.workers=[]; this.idle=[]; this.callbacks=new Map();
++    for(let i=0;i<this.poolSize;i++){
++      const w=new Worker(workerScript,{type:'module'});
++      w.onmessage=e=>this._onMessage(e,w);
++      w.onerror=err=>console.error('Mesher worker error',err);
++      this.workers.push(w); this.idle.push(w);
++    }
++  }
++  _onMessage(e,worker){
++    const data=e.data;
++    if(data&&data.error){ const cb=this.callbacks.get(worker); if(cb){cb.reject(new Error(data.error)); this.callbacks.delete(worker);} this.idle.push(worker); return;}
++    const cb=this.callbacks.get(worker); if(!cb){this.idle.push(worker); return;}
++    this.callbacks.delete(worker); cb.resolve({vertices:data.vertices,indices:data.indices}); this.idle.push(worker);
++  }
++  meshChunk(blocksTypedArray,dims,options={}){ return new Promise((resolve,reject)=>{
++    const worker=this.idle.pop();
++    if(!worker){reject(new Error('No mesher worker available')); return;}
++    this.callbacks.set(worker,{resolve,reject});
++    try{worker.postMessage({blocks:blocksTypedArray,dims,options},[blocksTypedArray.buffer]);}catch(err){this.idle.push(worker); this.callbacks.delete(worker); reject(err);}
++  });}
++  dispose(){this.workers.forEach(w=>w.terminate()); this.workers.length=0; this.idle.length=0; this.callbacks.clear();}
++}
++export default MesherPool;
+diff --git a/web/js/init/chromebookModeInit.js b/web/js/init/chromebookModeInit.js
+new file mode 100644
+index 0000000..abcdef0
++++ b/web/js/init/chromebookModeInit.js
+@@
++import MesherPool from '../meshing/mesherPool.js';
++
++export function applyChromebookMode(client){
++  const opts=window.eaglercraftXOpts||{};
++  if(!opts.chromebookMode) return;
++  const def=opts.defaultGraphics||{};
++  if(client&&client.settings){
++    client.settings.set('renderDistance',def.renderDistance||client.settings.get('renderDistance'));
++    client.settings.set('enableShadows',!!def.enableShadows);
++    client.settings.set('enablePBR',!!def.enablePBR);
++    client.settings.set('enableReflections',!!def.enableReflections);
++    client.settings.set('particles',def.particles||'minimal');
++    client.settings.set('vsync',!!def.vsync);
++    if(def.maxFPS) client.settings.set('maxFPS',def.maxFPS);
++  }
++  const poolSize=def.maxChunkMeshingWorkers||Math.max(1,Math.floor((navigator.hardwareConcurrency||2)/2));
++  const mesherPool=new MesherPool('/js/meshing/mesher.worker.js',poolSize);
++  client.mesherPool=mesherPool;
++  console.log('Chromebook mode applied: mesherPool size='+poolSize);
++}
